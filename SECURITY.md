@@ -6,7 +6,7 @@ skilliterate is a local, single-user command-line tool. It trusts its own config
 - Reads pull requests and review threads through `gh`, using your existing login.
 - Sends review text and skill files to the `claude` CLI and to OpenRouter.
 - Writes a local SQLite database that contains review text from your repos.
-- Never pushes, writes to a base branch or merges. Skill edits are drafted in a local git worktree on a `skilliterate/` branch; you review, push and open the PR yourself. (Opening draft PRs through the API is planned and will keep the same rule: only new `skilliterate/` branches, never the base.)
+- Never writes to a base branch or merges. Its only GitHub writes are `patch pr`: creating a new `skilliterate/` branch with one commit and opening a draft PR. It refuses if a file it would change moved on the base since the draft; you review and merge the PR yourself.
 
 ## Keys
 The OpenRouter key is read from the environment variable named in the config, or from a `.env` file in the working directory. It is sent only in the request's `Authorization` header and is not logged or stored.

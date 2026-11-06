@@ -1,7 +1,19 @@
-//! Thin read-only GitHub helpers over `gh api` (reuses its auth). Nothing here writes to GitHub.
+//! Thin GitHub helpers over `gh api` (reuses its auth). Reads are free-form; the only writes are
+//! `commit_to_new_branch` and `open_draft_pr`, which touch nothing but a fresh `skilliterate/` branch.
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
-use std::process::Command;
+use serde_json::{json, Value};
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+/// POST a JSON body (`method` is POST or PATCH) and parse the JSON reply.
+fn send(method: &str, path: &str, body: &Value) -> Result<Value> {
+    let mut child = Command::new("gh").args(["api", "-X", method, path, "--input", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("running gh (is it installed?)")?;
+    child.stdin.take().context("gh stdin")?.write_all(body.to_string().as_bytes())?;
+    let o = child.wait_with_output()?;
+    if !o.status.success() { bail!("gh api {method} {path}: {}", String::from_utf8_lossy(&o.stderr).trim()); }
+    Ok(serde_json::from_slice(&o.stdout)?)
+}
 
 fn run(args: &[&str]) -> Result<String> {
     let o = Command::new("gh").args(args).output().context("running gh (is it installed?)")?;
@@ -69,6 +81,38 @@ pub fn find_skill_files(slug: &str, branch: &str) -> Result<Vec<String>> {
     slug_ok(slug)?;
     let v = get(&format!("repos/{slug}/git/trees/{branch}?recursive=1"))?;
     Ok(v["tree"].as_array().map(|t| t.iter().filter_map(|n| n["path"].as_str()).filter(|p| p.ends_with("SKILL.md")).map(String::from).collect()).unwrap_or_default())
+}
+
+/// Head commit sha of a branch.
+pub fn branch_head(slug: &str, branch: &str) -> Result<String> {
+    slug_ok(slug)?;
+    let v = get(&format!("repos/{slug}/git/ref/heads/{branch}"))?;
+    Ok(v["object"]["sha"].as_str().context("branch has no head sha")?.to_string())
+}
+
+/// Create `branch` (must start with `skilliterate/`) from the head of `base` with ONE commit that writes
+/// `files` (path, full content). Uses the git-data API, so no clone is needed. The ref is created last:
+/// if anything fails earlier, nothing is left on the repo except unreferenced objects.
+/// Fails if the branch already exists. Returns the new commit sha.
+pub fn commit_to_new_branch(slug: &str, base: &str, branch: &str, message: &str, files: &[(String, String)]) -> Result<String> {
+    slug_ok(slug)?;
+    if !branch.starts_with("skilliterate/") || branch.contains("..") || branch.contains(char::is_whitespace) { bail!("refusing to write branch '{branch}': must start with skilliterate/"); }
+    if files.is_empty() { bail!("nothing to commit"); }
+    let head = branch_head(slug, base)?;
+    let base_tree = get(&format!("repos/{slug}/git/commits/{head}"))?["tree"]["sha"].as_str().context("base commit has no tree")?.to_string();
+    let entries: Vec<Value> = files.iter().map(|(p, c)| json!({"path": p, "mode": "100644", "type": "blob", "content": c})).collect();
+    let tree = send("POST", &format!("repos/{slug}/git/trees"), &json!({"base_tree": base_tree, "tree": entries}))?;
+    let commit = send("POST", &format!("repos/{slug}/git/commits"), &json!({"message": message, "tree": tree["sha"], "parents": [head]}))?;
+    let sha = commit["sha"].as_str().context("commit has no sha")?.to_string();
+    send("POST", &format!("repos/{slug}/git/refs"), &json!({"ref": format!("refs/heads/{branch}"), "sha": sha}))?;
+    Ok(sha)
+}
+
+/// Open a **draft** pull request from `head` into `base`; returns its URL.
+pub fn open_draft_pr(slug: &str, base: &str, head: &str, title: &str, body: &str) -> Result<String> {
+    slug_ok(slug)?;
+    let v = send("POST", &format!("repos/{slug}/pulls"), &json!({"title": title, "head": head, "base": base, "body": body, "draft": true}))?;
+    Ok(v["html_url"].as_str().context("PR has no url")?.to_string())
 }
 
 /// `2026-11-05T15:52:40Z` -> unix seconds (UTC).

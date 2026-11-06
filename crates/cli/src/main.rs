@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 mod adjust;
 mod patch;
 mod report;
@@ -63,12 +63,14 @@ enum Adjust {
 enum PatchCmd {
     /// Priority of categories for a skill (severity-weighted)
     Rank { skill: String },
-    /// Draft a skill edit for a category in a git worktree (nothing is committed or pushed)
+    /// Draft a skill edit for a category, read through the GitHub API (nothing is written to GitHub)
     Draft { skill: String, category: String, #[arg(long)] base: Option<String>, #[arg(long)] check_against: Vec<String>,
             #[arg(long, default_value_t = 40)] max_evidence: usize },
     /// Show the diff of a drafted adjustment
     Show { id: i64 },
-    /// Discard a draft: remove its worktree and branch
+    /// Push a draft as a new skilliterate/ branch via the API and open a DRAFT pull request
+    Pr { id: i64 },
+    /// Discard a draft that has not been pushed
     Drop { id: i64 },
 }
 
@@ -179,8 +181,9 @@ fn main() -> Result<()> {
         },
         Cmd::Patch { cmd } => match cmd {
             PatchCmd::Rank { skill } => patch::rank(&conn, &skill)?,
-            PatchCmd::Draft { skill, category, base, check_against, max_evidence } => patch::draft(&conn, &skill, &category, base.as_deref(), &check_against, max_evidence)?,
+            PatchCmd::Draft { skill, category, base, check_against, max_evidence } => patch::draft(&conn, cfg.as_ref().context("no config found; run `skilliterate setup`")?, &skill, &category, base.as_deref(), &check_against, max_evidence)?,
             PatchCmd::Show { id } => patch::show(&conn, id)?,
+            PatchCmd::Pr { id } => patch::open_pr(&conn, id)?,
             PatchCmd::Drop { id } => patch::drop_draft(&conn, id)?,
         },
         Cmd::Reparse => println!("reparsed {}", skilliterate_gh::reparse_headers(&conn)?),
