@@ -29,7 +29,7 @@ skilliterate setup --skill my-skill --repo owner/repo --path skills/my-skill/SKI
 skilliterate setup --check           # re-run the checks only
 ```
 
-See `skilliterate.example.toml` for the config. The tool never writes to a base branch and never merges: improvements are drafted as local worktrees on `skilliterate/…` branches. Opening them as draft pull requests through the GitHub API is planned; until then you push and open the PR yourself.
+See `skilliterate.example.toml` for the config. The tool never writes to a base branch and never merges: improvements are drafted from files read through the GitHub API (`patch draft`), and `patch pr <id>` pushes them as a new `skilliterate/…` branch and opens a **draft** pull request that you review and merge yourself.
 
 ## Privacy
 Everything stays on your machine. The database holds review text from your private repos, so `data/` and `skilliterate.toml` are git-ignored; keep them that way. Review text is sent to the `claude` CLI and to OpenRouter for analysis.

@@ -18,7 +18,7 @@ ingest → verdict → root-cause → taxonomy → categorize → report → ski
 | 4 | taxonomy | Propose mistake categories from the root causes; a human approves them | `claude` (Sonnet) + human |
 | 5 | categorize | Assign every finding to an approved category | OpenRouter (Jev) |
 | 6 | report | Accepted findings per 1000 changed lines, per category, per month and per skill version | none (SQL) |
-| 7 | skill-patch | Draft a minimal skill edit for a category (opening it as a draft PR is planned) | `claude` (Sonnet) |
+| 7 | skill-patch | Draft a minimal skill edit for a category and open it as a draft PR | `claude` (Sonnet) |
 | 8 | measure | Compare a category's rate before and after each shipped adjustment | none (SQL) |
 
 Each stage is incremental and resumable: it only processes rows that lack its output, and every model call is logged with its cost.
@@ -59,11 +59,11 @@ Config file lookup: `$SKILLITERATE_CONFIG`, `./skilliterate.toml`, `~/.config/sk
 
 ## Patching
 
-Status: `patch draft` currently reads a local clone and uses git worktrees. Porting it to the GitHub API (no clone) and adding `patch pr` is the next step.
+Status: `patch draft` and `patch pr` work through the GitHub API; no clone or worktree is needed.
 
-Target design:
+Flow:
 1. `patch draft <skill> <category>` fetches the skill file and its related files at the base branch, asks the model for the smallest edit, validates that each edit matches exactly once, bumps the versions, and stores the result.
-2. `patch pr <id>` creates a branch `skilliterate/adj-<id>-<slug>` from the base head through the API, commits the files and opens a **draft** PR. It never writes to the base branch or any other ref, never merges, and refuses if the skill file changed on the base since the draft.
+2. `patch pr <id>` creates a branch `skilliterate/adj-<id>-<slug>` from the base head through the git-data API (one commit for all files), then opens a **draft** PR. It never writes to the base branch or any other ref, never merges, and refuses if any file it would change moved on the base since the draft. `patch drop` only discards unpushed drafts.
 3. After the merge, the next `run` records the ship time.
 
 ## Crates

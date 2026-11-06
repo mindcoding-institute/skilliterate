@@ -1,15 +1,13 @@
 //! Skill-patch stage: turn a mistake category's evidence into a minimal, validated edit of the skill file,
-//! applied in a git worktree for review. Every draft is recorded as a `proposed` skill adjustment.
-use crate::{adjust, skills::git};
+//! computed from files read through the GitHub API (no clone). Every draft is stored as a `proposed`
+//! skill adjustment; `pr` later pushes it as a new `skilliterate/` branch and opens a draft PR.
+use crate::adjust;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use skilliterate_core::config::Config;
+use skilliterate_gh::api;
 use skilliterate_llm::Claude;
-
-fn meta(conn: &Connection, key: &str) -> Result<String> {
-    conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
-        .with_context(|| format!("'{key}' not set — run `skilliterate skills index --clone … --skill … --file …` first"))
-}
 
 /// Priority list: severity-weighted findings per category, over repos that use the skill.
 pub fn rank(conn: &Connection, skill: &str) -> Result<()> {
@@ -93,13 +91,11 @@ fn slug(s: &str) -> String {
     o.trim_matches('-').chars().take(40).collect()
 }
 
-pub fn draft(conn: &Connection, skill: &str, category_q: &str, base: Option<&str>, check_against: &[String], max_evidence: usize) -> Result<()> {
-    let clone = meta(conn, &format!("clone:{skill}"))?;
-    let file = meta(conn, &format!("file:{skill}"))?;
-    skilliterate_core::config::safe_rel(skill, &file)?;
-    if clone.starts_with('-') || !std::path::Path::new(&clone).is_dir() { bail!("clone '{clone}' is not a directory"); }
+pub fn draft(conn: &Connection, cfg: &Config, skill: &str, category_q: &str, base: Option<&str>, check_against: &[String], max_evidence: usize) -> Result<()> {
+    let sc = cfg.skill(skill)?;
+    let file = sc.path.clone();
     let bundle = load_bundle(conn, skill)?;
-    let base = base.map(String::from).or_else(|| bundle.base.clone()).unwrap_or_else(|| "origin/main".into());
+    let base = base.map(String::from).or_else(|| bundle.base.clone()).unwrap_or_else(|| sc.base.clone());
     let base = base.as_str();
     let cat = adjust::resolve_category(conn, category_q)?;
     let (cname, cdesc, cbound): (String, String, String) = conn.query_row(
@@ -117,17 +113,13 @@ pub fn draft(conn: &Connection, skill: &str, category_q: &str, base: Option<&str
     let evidence: Vec<_> = all.iter().filter(|e| seen.insert(e.4.clone())).take(max_evidence).collect();
     let ev_text = evidence.iter().map(|e| format!("- [{}] {} — {} → {}", e.1, e.2, e.3, e.4)).collect::<Vec<_>>().join("\n");
 
-    if base.starts_with('-') || base.contains(char::is_whitespace) { bail!("invalid base ref '{base}'"); }
-    git(&clone, &["rev-parse", "--verify", base]).with_context(|| format!("base ref '{base}' not found in {clone}"))?;
-    let content = git(&clone, &["show", &format!("{base}:{file}")])?;
-    // 
+    if base.starts_with('-') || base.contains(char::is_whitespace) { bail!("invalid base branch '{base}'"); }
+    let content = api::file_at(&sc.repo, &file, base)?.with_context(|| format!("{file} not found on {}@{base}", sc.repo))?;
     // Optional: refuse to draft when the skill file differs on other branches that also release it (`--check-against`).
-    {
-        for other in check_against.iter().map(String::as_str) {
-            if other == base || other.starts_with('-') { continue; }
-            if let Ok(o) = git(&clone, &["show", &format!("{other}:{file}")]) {
-                if o != content { bail!("{file} differs between {base} and {other} (versions {:?} vs {:?}); reconcile the branches first", current_version(&content), current_version(&o)); }
-            }
+    for other in check_against.iter().map(String::as_str) {
+        if other == base || other.starts_with('-') { continue; }
+        if let Some(o) = api::file_at(&sc.repo, &file, other)? {
+            if o != content { bail!("{file} differs between {base} and {other} (versions {:?} vs {:?}); reconcile the branches first", current_version(&content), current_version(&o)); }
         }
     }
     let old_version = current_version(&content).context("no version in skill frontmatter")?;
@@ -179,53 +171,97 @@ pub fn draft(conn: &Connection, skill: &str, category_q: &str, base: Option<&str
     let id = conn.last_insert_rowid();
     for e in &evidence { conn.execute("INSERT OR IGNORE INTO adjustment_evidence(adjustment_id,finding_id) VALUES(?1,?2)", params![id, e.0])?; }
 
-    let branch = format!("skilliterate/adj-{id}-{}", slug(&cname));
-    let wt = std::env::current_dir()?.join("data/worktrees").join(format!("adj-{id}"));
-    git(&clone, &["worktree", "add", "-q", "-b", &branch, wt.to_str().unwrap(), base])?;
-    std::fs::write(wt.join(&file), &new_content)?;
+    // Every file the PR will write, with the blob it was derived from (None = new file) so `pr` can refuse if the base moved.
+    let mut files: Vec<(String, String)> = vec![(file.clone(), new_content.clone())];
     let mut bundle_notes = Vec::new();
-    for m in &bundle.mirrors { std::fs::write(wt.join(m), &new_content)?; bundle_notes.push(format!("mirror {m}")); }
-    for j in &bundle.json_versions {
-        let (t, o, n) = bump_json_version(&std::fs::read_to_string(wt.join(j))?, None)?;
-        std::fs::write(wt.join(j), t)?; bundle_notes.push(format!("{j} {o} → {n}"));
+    for m in bundle.mirrors.iter().chain(&sc.extra_files) { files.push((m.clone(), new_content.clone())); bundle_notes.push(format!("mirror {m}")); }
+    for j in bundle.json_versions.iter().chain(&sc.version_files) {
+        let text = api::file_at(&sc.repo, j, base)?.with_context(|| format!("{j} not found on {base}"))?;
+        let (t, o, n) = bump_json_version(&text, None)?;
+        files.push((j.clone(), t)); bundle_notes.push(format!("{j} {o} → {n}"));
     }
-    if let Some((f, plugin)) = &bundle.marketplace {
-        let (t, o, n) = bump_json_version(&std::fs::read_to_string(wt.join(f))?, Some(&format!("\"name\": \"{plugin}\"")))?;
-        std::fs::write(wt.join(f), t)?; bundle_notes.push(format!("{f} [{plugin}] {o} → {n}"));
+    let market = sc.marketplace_file.clone().zip(sc.marketplace_plugin.clone()).or(bundle.marketplace.clone());
+    if let Some((f, plugin)) = &market {
+        let text = api::file_at(&sc.repo, f, base)?.with_context(|| format!("{f} not found on {base}"))?;
+        let (t, o, n) = bump_json_version(&text, Some(&format!("\"name\": \"{plugin}\"")))?;
+        files.push((f.clone(), t)); bundle_notes.push(format!("{f} [{plugin}] {o} → {n}"));
     }
-    let diff = git(wt.to_str().unwrap(), &["diff"])?;
-    std::fs::create_dir_all("data/patches")?;
-    std::fs::write(format!("data/patches/adj-{id}.diff"), &diff)?;
-    conn.execute("UPDATE skill_adjustments SET branch=?2, worktree=?3 WHERE id=?1", params![id, branch, wt.to_str().unwrap()])?;
+    let mut seen_paths = std::collections::HashSet::new();
+    files.retain(|(p, _)| seen_paths.insert(p.clone()));
 
-    println!("adjustment #{id} drafted for «{cname}»  v{old_version} → v{new_version}  (${cost_total:.3})\n  {summary}\n  why: {rationale}\n  evidence: {} findings (of {})\n  branch {branch}\n  worktree {}\n  bundle: {}\n  diff saved to data/patches/adj-{id}.diff\n\n{diff}",
-        evidence.len(), all.len(), wt.display(), if bundle_notes.is_empty() { "(single file)".to_string() } else { bundle_notes.join("; ") });
+    let mut diff = String::new();
+    let mut payload_files = Vec::new();
+    for (p, new) in &files {
+        let old = api::file_at(&sc.repo, p, base)?;
+        diff.push_str(&unified_diff(p, old.as_deref().unwrap_or(""), new)?);
+        payload_files.push(json!({"path": p, "content": new, "base_blob": api::blob_sha(&sc.repo, p, base)?}));
+    }
+    let payload = json!({"repo": sc.repo, "base": base, "files": payload_files, "rationale": rationale, "evidence": evidence.len(), "total": all.len()});
+    let branch = format!("skilliterate/adj-{id}-{}", slug(&cname));
+    conn.execute("UPDATE skill_adjustments SET branch=?2, payload=?3, diff=?4 WHERE id=?1", params![id, branch, payload.to_string(), diff])?;
+
+    println!("adjustment #{id} drafted for «{cname}»  v{old_version} → v{new_version}  (${cost_total:.3})\n  {summary}\n  why: {rationale}\n  evidence: {} findings (of {})\n  branch (on `patch pr {id}`): {branch}\n  bundle: {}\n\n{diff}\nnext: `skilliterate patch pr {id}` opens a draft PR on {}",
+        evidence.len(), all.len(), if bundle_notes.is_empty() { "(single file)".to_string() } else { bundle_notes.join("; ") }, sc.repo);
+    Ok(())
+}
+
+/// Unified diff of one file via `git diff --no-index` on two temp files (git is only used as a diff engine).
+fn unified_diff(path: &str, old: &str, new: &str) -> Result<String> {
+    let dir = std::env::temp_dir().join(format!("skilliterate-diff-{}", std::process::id()));
+    let (a, b) = (dir.join("a").join(path), dir.join("b").join(path));
+    for (f, t) in [(&a, old), (&b, new)] { std::fs::create_dir_all(f.parent().unwrap())?; std::fs::write(f, t)?; }
+    let out = std::process::Command::new("git").current_dir(&dir).args(["diff", "--no-index", "--no-color", "--", &format!("a/{path}"), &format!("b/{path}")]).output().context("running git")?;
+    let _ = std::fs::remove_dir_all(&dir);
+    // exit code 1 just means "files differ"
+    if out.status.code().map_or(true, |c| c > 1) { bail!("git diff: {}", String::from_utf8_lossy(&out.stderr)); }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Push a drafted adjustment as a new `skilliterate/` branch through the API and open a DRAFT pull request.
+/// Never writes to the base branch, never merges; refuses if any file it would change moved on the base since the draft.
+pub fn open_pr(conn: &Connection, id: i64) -> Result<()> {
+    let (skill, status, branch, payload, summary, version, cat, pr_url): (String, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>) = conn.query_row(
+        "SELECT a.skill,a.status,a.branch,a.payload,a.summary,a.version_label,(SELECT name FROM categories WHERE id=a.category_id),a.pr_url FROM skill_adjustments a WHERE a.id=?1", [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).context("no such adjustment")?;
+    if status != "proposed" || pr_url.is_some() { bail!("adjustment #{id} is '{status}'{}; only a fresh proposed draft can be opened", pr_url.map(|u| format!(" ({u})")).unwrap_or_default()); }
+    let (Some(branch), Some(payload)) = (branch, payload) else { bail!("adjustment #{id} has no stored draft (drafted before API mode?); run `patch draft` again") };
+    let p: Value = serde_json::from_str(&payload)?;
+    let (repo, base) = (p["repo"].as_str().context("payload: repo")?, p["base"].as_str().context("payload: base")?);
+    let mut files = Vec::new();
+    for f in p["files"].as_array().context("payload: files")? {
+        let path = f["path"].as_str().context("payload: path")?;
+        skilliterate_core::config::safe_rel(&skill, path)?;
+        if api::blob_sha(repo, path, base)?.as_deref() != f["base_blob"].as_str() {
+            bail!("{path} changed on {repo}@{base} since the draft; run `skilliterate patch draft` again (or `patch drop {id}`)");
+        }
+        files.push((path.to_string(), f["content"].as_str().context("payload: content")?.to_string()));
+    }
+    let v = version.as_deref().unwrap_or("?");
+    let title = format!("skill: {summary}");
+    let sha = api::commit_to_new_branch(repo, base, &branch, &format!("{title}\n\nBump to v{v}."), &files)?;
+    let body = format!("{summary}\n\n**Category:** {}\n**Why:** {}\n**Evidence:** {} of {} findings in this category.\n**Version:** {v}\n\nDrafted by skilliterate from review-finding evidence. Draft PR: review and merge manually.",
+        cat.unwrap_or_default(), p["rationale"].as_str().unwrap_or(""), p["evidence"], p["total"]);
+    let url = match api::open_draft_pr(repo, base, &branch, &title, &body) {
+        Ok(u) => u,
+        Err(e) => { conn.execute("UPDATE skill_adjustments SET status='pushed' WHERE id=?1", [id])?; bail!("branch {branch} was pushed ({sha}) but opening the PR failed: {e}") }
+    };
+    conn.execute("UPDATE skill_adjustments SET status='pr_open', pr_url=?2 WHERE id=?1", params![id, url])?;
+    println!("adjustment #{id}: draft PR opened → {url}\n  branch {branch} @ {sha}\nAfter it merges, run `skilliterate adjust ship {id}`.");
     Ok(())
 }
 
 pub fn show(conn: &Connection, id: i64) -> Result<()> {
-    let (wt, file): (Option<String>, String) = conn.query_row(
-        "SELECT a.worktree, (SELECT value FROM meta WHERE key='file:'||a.skill) FROM skill_adjustments a WHERE a.id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    let Some(wt) = wt else { bail!("adjustment #{id} has no worktree") };
-    let _ = file;
-    print!("{}", git(&wt, &["diff"])?);
+    let diff: Option<String> = conn.query_row("SELECT diff FROM skill_adjustments WHERE id=?1", [id], |r| r.get(0)).context("no such adjustment")?;
+    print!("{}", diff.context("adjustment has no stored diff")?);
     Ok(())
 }
 
+/// Discard a draft that has not been pushed. A pushed branch / open PR is left for the user to close on GitHub.
 pub fn drop_draft(conn: &Connection, id: i64) -> Result<()> {
-    let (wt, branch, clone): (Option<String>, Option<String>, String) = conn.query_row(
-        "SELECT a.worktree,a.branch,(SELECT value FROM meta WHERE key='clone:'||a.skill) FROM skill_adjustments a WHERE a.id=?1 AND a.status='proposed'", [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).context("no such proposed adjustment")?;
-    // Only ever remove what this tool created, even if the database was edited by hand.
-    if let Some(b) = &branch { if !b.starts_with("skilliterate/") { bail!("refusing to delete branch '{b}': not a skilliterate/ branch"); } }
-    if let Some(w) = &wt {
-        let root = std::env::current_dir()?.join("data/worktrees");
-        if !std::path::Path::new(w).starts_with(&root) || w.contains("..") { bail!("refusing to remove '{w}': not under {}", root.display()); }
-    }
-    if let Some(w) = wt { git(&clone, &["worktree", "remove", "--force", "--", &w])?; }
-    if let Some(b) = branch { git(&clone, &["branch", "-D", "--", &b])?; }
-    conn.execute("UPDATE skill_adjustments SET status='dropped', worktree=NULL WHERE id=?1", [id])?;
-    println!("adjustment #{id} dropped (worktree and branch removed)");
+    let (status, pr): (String, Option<String>) = conn.query_row("SELECT status,pr_url FROM skill_adjustments WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).context("no such adjustment")?;
+    if status != "proposed" { bail!("adjustment #{id} is '{status}'{}; close the PR/branch on GitHub instead", pr.map(|u| format!(" ({u})")).unwrap_or_default()); }
+    conn.execute("UPDATE skill_adjustments SET status='dropped', payload=NULL WHERE id=?1", [id])?;
+    println!("adjustment #{id} dropped");
     Ok(())
 }
 
@@ -256,6 +292,13 @@ mod tests {
         assert!(n.contains("\"version\": \"1.0.0\"") && n.contains("\"version\": \"0.1.1\""));
         let (_, o2, _) = bump_json_version(t, None).unwrap();
         assert_eq!(o2, "1.0.0");
+    }
+    #[test]
+    fn diff_shows_change_and_new_file() {
+        let d = unified_diff("s/SKILL.md", "a\nb\n", "a\nb\nc\n").unwrap();
+        assert!(d.contains("+c") && !d.contains("-b"));
+        assert!(unified_diff("n.md", "", "x\n").unwrap().contains("+x"));
+        assert_eq!(unified_diff("same.md", "x\n", "x\n").unwrap(), "");
     }
     #[test]
     fn slugs() { assert_eq!(slug("Weak input validation & normalization"), "weak-input-validation-normalization"); }

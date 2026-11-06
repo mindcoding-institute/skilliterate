@@ -64,6 +64,7 @@ fn prepare(c: Connection) -> Result<Connection> {
     for (table, col, ty) in [
         ("prs", "created_at", "TEXT"), ("prs", "additions", "INTEGER"), ("prs", "deletions", "INTEGER"),
         ("prs", "changed_files", "INTEGER"), ("prs", "skill_marker", "TEXT"), ("repos", "skill", "TEXT"), ("skill_adjustments", "branch", "TEXT"), ("skill_adjustments", "worktree", "TEXT"),
+        ("skill_adjustments", "payload", "TEXT"), ("skill_adjustments", "diff", "TEXT"),
     ] {
         let has: i64 = c.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
         if has == 0 { c.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), [])?; }
