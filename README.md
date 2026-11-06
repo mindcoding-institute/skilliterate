@@ -6,6 +6,14 @@ A local, single-user command-line tool. It mines review-bot threads (CodeRabbit 
 
 Status: early. See [DESIGN.md](DESIGN.md) for the pipeline and the plan.
 
+## Part of Mind Coding Institute
+skilliterate is part of the [Mind Coding Institute](https://mindcoding.institute), whose tagline is "Intent precedes prompt": form the mental model first, then direct the machine. The site is organised around three pillars, [Intent](https://mindcoding.institute/pillars/intent), [Leverage](https://mindcoding.institute/pillars/leverage) and [Judgment](https://mindcoding.institute/pillars/judgment). skilliterate is a Leverage multiplier: it uses review feedback to make your agent skills better over time.
+
+- [Website](https://mindcoding.institute) and [the approach](https://mindcoding.institute/approach)
+- [Multipliers directory](https://multipliers.mindcoding.institute)
+- [GitHub organisation](https://github.com/mindcoding-institute) and the [proposal doc](https://github.com/mindcoding-institute/docs/blob/main/docs/proposal.md)
+- [Articles](https://mindcoding.substack.com/) and [Discord](https://discord.gg/TT7eGw27g8)
+
 ## Prerequisites
 - [`claude`](https://claude.com/claude-code) CLI, logged in (Codex support is planned)
 - [`gh`](https://cli.github.com) logged in; your skills live in GitHub repos
